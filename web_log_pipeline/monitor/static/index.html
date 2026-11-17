@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>웹 로그 실시간 모니터</title>
+<style>
+  :root {
+    --bg: #f5f6f8; --card: #ffffff; --text: #1d2433; --muted: #6b7385; --line: #e3e6ec;
+    --ok: #1f9d55; --err: #d64545; --accent: #2f5bea;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; font-family: -apple-system, "Segoe UI", "Malgun Gothic", "Apple SD Gothic Neo", sans-serif;
+         background: var(--bg); color: var(--text); }
+  header { display: flex; align-items: center; justify-content: space-between; gap: 16px;
+           padding: 18px 28px; background: var(--card); border-bottom: 1px solid var(--line); }
+  h1 { font-size: 20px; margin: 0; }
+  .sub { color: var(--muted); font-size: 13px; margin-top: 4px; }
+  main { padding: 24px 28px; display: grid; gap: 20px; }
+  .cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 16px 18px; }
+  .card .label { color: var(--muted); font-size: 13px; }
+  .card .value { font-size: 28px; font-weight: 700; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); } .err { color: var(--err); }
+  .grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+  @media (max-width: 900px) { .grid2 { grid-template-columns: 1fr; } }
+  section { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  section h2 { font-size: 15px; margin: 0 0 14px; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; font-variant-numeric: tabular-nums; }
+  th, td { text-align: left; padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  tr.row-err td { background: #fdf0f0; }
+  .bar { height: 8px; background: #eef0f4; border-radius: 4px; overflow: hidden; min-width: 80px; }
+  .bar > div { height: 100%; background: var(--err); }
+  button { border: 0; border-radius: 10px; padding: 11px 18px; font-size: 14px; font-weight: 700;
+           cursor: pointer; background: var(--err); color: #fff; }
+  button.on { background: var(--ok); }
+  .banner { display: none; background: var(--err); color: #fff; padding: 10px 28px; font-weight: 700; }
+  .banner.show { display: block; }
+  .chart { display: flex; align-items: flex-end; gap: 10px; height: 140px; padding-top: 6px; }
+  .col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 6px; height: 100%; justify-content: flex-end; }
+  .stack { width: 100%; max-width: 46px; display: flex; flex-direction: column-reverse; border-radius: 6px 6px 0 0; overflow: hidden; }
+  .stack .s-ok { background: #9bd8b4; } .stack .s-err { background: var(--err); }
+  .col span { font-size: 11px; color: var(--muted); }
+  .empty { color: var(--muted); font-size: 13px; padding: 12px 0; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>웹 로그 실시간 모니터</h1>
+    <div class="sub">producer → Kafka(web.logs.ok / web.logs.error) → consumer → 이 화면 · 2초마다 자동 갱신 · <span id="updated">-</span></div>
+  </div>
+  <button id="faultBtn">주문 API 장애 발생시키기</button>
+</header>
+<div class="banner" id="banner"></div>
+<main>
+  <div class="cards">
+    <div class="card"><div class="label">전체 요청</div><div class="value" id="total">0</div></div>
+    <div class="card"><div class="label">정상 (ok)</div><div class="value ok" id="ok">0</div></div>
+    <div class="card"><div class="label">에러 (error)</div><div class="value err" id="error">0</div></div>
+    <div class="card"><div class="label">전체 에러율</div><div class="value" id="errorRate">0%</div></div>
+    <div class="card"><div class="label">최근 1분 에러율</div><div class="value" id="minuteRate">0%</div></div>
+    <div class="card"><div class="label">처리 지연 (평균)</div><div class="value" id="delay">-</div></div>
+  </div>
+
+  <div class="grid2">
+    <section>
+      <h2>최근 1분 · 10초 단위 요청 수 (빨강 = 에러)</h2>
+      <div class="chart" id="chart"></div>
+    </section>
+    <section>
+      <h2>엔드포인트별 통계</h2>
+      <table>
+        <thead><tr><th>경로</th><th>요청</th><th>에러</th><th>에러율</th><th></th><th>평균 응답</th></tr></thead>
+        <tbody id="endpoints"></tbody>
+      </table>
+    </section>
+  </div>
+
+  <section>
+    <h2>최근 이벤트 20건</h2>
+    <table>
+      <thead><tr><th>시각</th><th>메서드</th><th>경로</th><th>상태</th><th>응답 시간</th><th>분류</th><th>offset</th></tr></thead>
+      <tbody id="recent"></tbody>
+    </table>
+  </section>
+</main>
+
+<script>
+const $ = (id) => document.getElementById(id);
+const pct = (v) => (v * 100).toFixed(1) + "%";
+const pad = (n) => String(n).padStart(2, "0");
+const localTime = (ts) => {
+  const d = new Date(ts);
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}.${ts.slice(20, 23)}`;
+};
+const esc = (s) => String(s).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
+
+function render(d) {
+  $("total").textContent = d.total;
+  $("ok").textContent = d.ok;
+  $("error").textContent = d.error;
+  $("errorRate").textContent = pct(d.error_rate);
+  $("minuteRate").textContent = pct(d.last_minute_error_rate);
+  $("minuteRate").className = "value" + (d.last_minute_error_rate >= 0.1 ? " err" : "");
+  $("delay").textContent = d.avg_delay_ms === null ? "-" : d.avg_delay_ms + "ms";
+  $("updated").textContent = "마지막 이벤트 " + (d.last_event_at ? localTime(d.last_event_at).slice(0, 8) : "없음");
+  $("banner").classList.toggle("show", d.alerts.length > 0);
+  $("banner").textContent = d.alerts.map((a) =>
+    `⚠ 알림: ${a.path} 최근 1분 에러율 ${pct(a.error_rate)} (${a.error}/${a.total}건)`).join("   ");
+
+  const btn = $("faultBtn");
+  btn.textContent = d.fault_mode ? "장애 복구하기" : "주문 API 장애 발생시키기";
+  btn.classList.toggle("on", d.fault_mode);
+
+  const max = Math.max(1, ...d.buckets.map((b) => b.total));
+  $("chart").innerHTML = d.buckets.map((b) => {
+    const h = (n) => (n / max) * 110;
+    return `<div class="col"><div class="stack">
+      <div class="s-ok" style="height:${h(b.total - b.error)}px"></div>
+      <div class="s-err" style="height:${h(b.error)}px"></div></div>
+      <span>${b.total}건 / ${b.label}</span></div>`;
+  }).join("");
+
+  $("endpoints").innerHTML = d.endpoints.length ? d.endpoints.map((e) => `
+    <tr class="${e.error_rate >= 0.2 ? "row-err" : ""}">
+      <td>${esc(e.path)}</td><td>${e.total}</td><td>${e.error}</td><td>${pct(e.error_rate)}</td>
+      <td><div class="bar"><div style="width:${Math.min(100, e.error_rate * 100)}%"></div></div></td>
+      <td>${e.avg_latency_ms}ms</td></tr>`).join("")
+    : `<tr><td colspan="6" class="empty">아직 데이터가 없습니다. producer와 consumer가 실행 중인지 확인하세요.</td></tr>`;
+
+  $("recent").innerHTML = d.recent.length ? d.recent.map((e) => `
+    <tr class="${e.classification === "error" ? "row-err" : ""}">
+      <td>${esc(localTime(e.timestamp))}</td><td>${esc(e.method)}</td><td>${esc(e.path)}</td>
+      <td>${e.status}</td><td>${e.latency_ms}ms</td>
+      <td class="${e.classification === "error" ? "err" : "ok"}">${esc(e.classification)}</td>
+      <td>${e.offset ?? "-"}</td></tr>`).join("")
+    : `<tr><td colspan="7" class="empty">아직 데이터가 없습니다.</td></tr>`;
+}
+
+async function refresh() {
+  try {
+    const res = await fetch("/api/summary");
+    render(await res.json());
+  } catch (e) {
+    $("updated").textContent = "monitor 연결 끊김";
+  }
+}
+
+$("faultBtn").addEventListener("click", async () => {
+  await fetch("/api/fault", { method: "POST" });
+  refresh();
+});
+
+refresh();
+setInterval(refresh, 2000);
+</script>
+</body>
+</html>
